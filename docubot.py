@@ -9,6 +9,16 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+import string
+
+# Common words ignored when scoring, so filler words don't count as matches
+STOP_WORDS = {"a", "an", "the", "is", "are", "was", "do", "does", "i", "how",
+              "what", "which", "where", "when", "why", "to", "of", "in", "on",
+              "for", "and", "or", "it", "my", "can", "we", "you", "there"}
+
+# Refusal guardrail: sections scoring below this are not returned
+MIN_SCORE = 2
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -50,7 +60,6 @@ class DocuBot:
 
     def build_index(self, documents):
         """
-        TODO (Phase 1):
         Build a tiny inverted index mapping lowercase words to the documents
         they appear in.
 
@@ -64,8 +73,12 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
-        return index
+        for filename, text in documents:
+            for raw in text.lower().split():
+                token = raw.strip(string.punctuation)
+                if token:
+                    index.setdefault(token, set()).add(filename)
+        return {token: sorted(files) for token, files in index.items()}
 
     # -----------------------------------------------------------
     # Scoring and Retrieval (Phase 1)
@@ -73,7 +86,6 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
         Return a simple relevance score for how well the text matches the query.
 
         Suggested baseline:
@@ -81,19 +93,63 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        query_words = {w.strip(string.punctuation) for w in query.lower().split()}
+        query_words -= STOP_WORDS | {""}
+        text_words = {w.strip(string.punctuation) for w in text.lower().split()}
+        return sum(1 for word in query_words if word in text_words)
+
+    def split_sections(self, text, max_chars=800):
+        """
+        Split a document into sections, one per Markdown heading.
+        A section that is longer than max_chars is split further by paragraph
+        (blank lines), so results stay small even without headings.
+        """
+        sections = []
+        for block in re.split(r"(?m)^(?=#{1,6} )", text):
+            block = block.strip()
+            if not block:
+                continue
+            if len(block) <= max_chars:
+                sections.append(block)
+                continue
+
+            # Too long: pack paragraphs together up to max_chars
+            current = ""
+            for paragraph in block.split("\n\n"):
+                if current and len(current) + len(paragraph) > max_chars:
+                    sections.append(current.strip())
+                    current = ""
+                current += paragraph + "\n\n"
+            if current.strip():
+                sections.append(current.strip())
+        return sections
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
         Use the index and scoring function to select top_k relevant document snippets.
 
         Return a list of (filename, text) sorted by score descending.
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        query_words = {w.strip(string.punctuation) for w in query.lower().split()}
+        query_words -= STOP_WORDS | {""}
+
+        # Use the index to find only documents sharing at least one word with the query
+        candidates = set()
+        for word in query_words:
+            candidates.update(self.index.get(word, []))
+
+        # Score smaller sections instead of whole files
+        scored = []
+        for filename, text in self.documents:
+            if filename in candidates:
+                for section in self.split_sections(text):
+                    score = self.score_document(query, section)
+                    if score >= MIN_SCORE:
+                        scored.append((score, filename, section))
+
+        # Highest score first; filename breaks ties so order is stable
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [(filename, text) for _, filename, text in scored[:top_k]]
 
     # -----------------------------------------------------------
     # Answering Modes
